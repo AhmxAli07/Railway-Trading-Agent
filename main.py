@@ -3,48 +3,55 @@ import time
 import random
 import requests
 from datetime import datetime
-
-# =============================================================
-# CONFIG — SET YOUR ENV VARIABLES ON RAILWAY
-# =============================================================
-
 import os
+
+# =============================================================
+# CONFIG
+# =============================================================
+
 
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "rcCZpy9TD4f2KJ9wzvBnrtUdCaX4ny205uPTbKQmMTaiebUet5KVmHMrY9Z2wvyr")
 BINANCE_SECRET     = os.getenv("BINANCE_SECRET", "I573pDLsdjhVNWsRrjfHVpRvand6yM82fhC2VnXMEJJxxTS3dX1fRuNWrt8CW65h")
 SLACK_WEBHOOK_URL  = os.getenv("SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/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")
 
-# PKR conversion rate (update if needed)
-PKR_RATE = 281.0
+PKR_RATE       = 281.0          # Updated live each cycle from CoinGecko
+PAIRS          = ["BNB/USDT", "USDC/USDT", "BTC/USDT"]
 
-# Trading pairs in PRIORITY order
-PAIRS = ["BNB/USDT", "USDC/USDT", "BTC/USDT"]
+# ⚠️ TOTAL_CAPITAL is NOT fixed — bot reads live USDT balance each cycle
+# This handles fee erosion automatically (57 → 56.8 → 56.5 etc)
 
-# Total capital in USDT
-TOTAL_CAPITAL = 57.0
-
-# Priority allocation ranges (min%, max%) — bot randomizes within
 ALLOCATION_RANGES = {
-    "BNB/USDT":  (0.45, 0.60),   # ~45–60% → highest priority
-    "USDC/USDT": (0.25, 0.35),   # ~25–35% → mid priority
-    "BTC/USDT":  (0.10, 0.20),   # ~10–20% → lowest priority
+    "BNB/USDT":  (0.45, 0.60),
+    "USDC/USDT": (0.25, 0.35),
+    "BTC/USDT":  (0.10, 0.20),
 }
 
-# Strategy params
-PROFIT_TARGET    = 0.003   # +0.3% → take profit
-STOP_LOSS        = 0.005   # -0.5% → cut loss
-CYCLE_MINUTES    = 30      # max hold time per cycle (minutes)
-CYCLE_SECONDS    = CYCLE_MINUTES * 60
-POLL_INTERVAL    = 30      # check price every 30 seconds
-DIP_THRESHOLD    = 0.002   # wait for at least -0.2% dip before buying
+PROFIT_TARGET    = 0.003         # +0.3% take profit
+STOP_LOSS        = 0.005         # -0.5% stop loss
+MIN_HOLD_MINUTES = 25            # minimum hold time
+MAX_HOLD_MINUTES = 45            # maximum hold time (random each trade → 25–45 min)
+POLL_INTERVAL    = 30            # price check every 30 seconds
+BINANCE_FEE_RATE = 0.001         # 0.1% per trade (taker fee)
+
+# ── [CHANGE 1] Per-pair dip thresholds ────────────────────────
+# USDC/USDT is stable — 0.01% threshold so dip triggers fast
+# BNB and BTC use the original 0.2% dip requirement
+DIP_THRESHOLDS = {
+    "BNB/USDT":  0.002,   # -0.2% dip required
+    "USDC/USDT": 0.0001,  # -0.01% dip (stable pair — triggers immediately)
+    "BTC/USDT":  0.002,   # -0.2% dip required
+}
+
+# ── [CHANGE 4] Fee-aware minimum net profit to trigger take-profit
+MIN_NET_PROFIT_USDT = 0.0005    # Must clear at least 0.05 cents net after fees
 
 # =============================================================
 # BINANCE SETUP
 # =============================================================
 
 exchange = ccxt.binance({
-    "apiKey":         BINANCE_API_KEY,
-    "secret":         BINANCE_SECRET,
+    "apiKey":          BINANCE_API_KEY,
+    "secret":          BINANCE_SECRET,
     "enableRateLimit": True,
     "options": {
         "defaultType": "spot"
@@ -52,47 +59,65 @@ exchange = ccxt.binance({
 })
 
 # =============================================================
-# SLACK NOTIFIER
+# SLACK
 # =============================================================
 
 def send_slack(message: str):
     try:
-        payload = {"text": message}
-        r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+        r = requests.post(SLACK_WEBHOOK_URL, json={"text": message}, timeout=10)
         if r.status_code != 200:
-            print(f"[Slack error] {r.status_code}: {r.text}")
+            print(f"[Slack error] {r.status_code}")
     except Exception as e:
-        print(f"[Slack exception] {e}")
+        print(f"[Slack error] {e}")
 
 # =============================================================
-# ALLOCATION RANDOMIZER
+# LIVE PKR RATE — fetched from CoinGecko each cycle
+# =============================================================
+
+def get_pkr_rate() -> float:
+    """Fetch live USDT/PKR rate. Falls back to 281 if fails."""
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "tether", "vs_currencies": "pkr"},
+            timeout=8
+        )
+        data = r.json()
+        rate = float(data["tether"]["pkr"])
+        print(f"[PKR Rate] Live rate fetched: {rate}")
+        return rate
+    except Exception as e:
+        print(f"[PKR Rate] Fallback to 281. Error: {e}")
+        return 281.0
+
+# =============================================================
+# LIVE BALANCE — reads actual USDT from Binance each cycle
+# =============================================================
+
+def get_live_capital() -> float:
+    """Always reads actual free USDT — accounts for fees automatically."""
+    balance = exchange.fetch_balance()
+    usdt = float(balance["USDT"]["free"])
+    print(f"[Capital] Live USDT balance: {usdt}")
+    return usdt
+
+# =============================================================
+# ALLOCATION RANDOMIZER — based on live balance, not fixed 57
 # =============================================================
 
 def randomize_allocations(total: float) -> dict:
-    """
-    Randomize amounts within priority ranges.
-    BNB gets most, USDC mid, BTC least.
-    Ensures total stays within budget.
-    """
-    raw = {}
-    for pair, (lo, hi) in ALLOCATION_RANGES.items():
-        raw[pair] = random.uniform(lo, hi)
-
-    # Normalize so they sum to 1.0
+    raw          = {p: random.uniform(lo, hi) for p, (lo, hi) in ALLOCATION_RANGES.items()}
     total_weight = sum(raw.values())
-    normalized = {p: w / total_weight for p, w in raw.items()}
-
-    # Apply to capital — round to 2 decimals
-    amounts = {}
-    allocated = 0.0
-    pairs = list(normalized.keys())
+    normalized   = {p: w / total_weight for p, w in raw.items()}
+    amounts      = {}
+    allocated    = 0.0
+    pairs        = list(normalized.keys())
     for i, pair in enumerate(pairs):
         if i == len(pairs) - 1:
             amounts[pair] = round(total - allocated, 2)
         else:
-            amounts[pair] = round(normalized[pair] * total, 2)
-            allocated += amounts[pair]
-
+            amounts[pair]  = round(normalized[pair] * total, 2)
+            allocated     += amounts[pair]
     return amounts
 
 # =============================================================
@@ -104,41 +129,58 @@ def get_price(symbol: str) -> float:
     return float(ticker["last"])
 
 def get_recent_prices(symbol: str, limit: int = 10) -> list:
-    """Returns closing prices from last `limit` 1-min candles."""
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe="1m", limit=limit)
     return [candle[4] for candle in ohlcv]
 
+# ── [CHANGE 1] detect_dip — live ticker for current price ─────
+# OLD: compared last candle close (up to 60s stale) as current price
+# NEW: fetches live ticker["last"] as the real current price
+#      Historical high still comes from candles[0:-1] (unchanged)
+#      Per-pair threshold used instead of one global DIP_THRESHOLD
 def detect_dip(symbol: str) -> tuple:
-    """
-    Returns (is_dip: bool, dip_pct: float)
-    Dip = current price is DIP_THRESHOLD% below recent high.
-    """
-    prices = get_recent_prices(symbol, limit=10)
-    recent_high = max(prices[:-1])   # high of last 9 candles
-    current     = prices[-1]
+    prices      = get_recent_prices(symbol, limit=10)
+    recent_high = max(prices[:-1])           # highest close from candles 1–9 (unchanged)
+    current     = get_price(symbol)          # CHANGED: live ticker price, not stale candle close
+    threshold   = DIP_THRESHOLDS.get(symbol, 0.002)   # per-pair threshold
     dip_pct     = (recent_high - current) / recent_high
-    return dip_pct >= DIP_THRESHOLD, dip_pct
+    return dip_pct >= threshold, round(dip_pct * 100, 4)
 
 # =============================================================
-# TRADE FUNCTIONS
+# BUY & SELL — precision-safe, no quoteOrderQty
 # =============================================================
 
 def buy_market(symbol: str, usdt_amount: float) -> dict:
-    """Buy `usdt_amount` worth of `symbol` at market price."""
-    # For BTC/BNB we pass quoteOrderQty; for USDC we pass amount directly
-    order = exchange.create_order(
-        symbol   = symbol,
-        type     = "market",
-        side     = "buy",
-        amount   = None,
-        params   = {"quoteOrderQty": usdt_amount}
-    )
+    """Convert USDT → base asset qty with Binance precision rules."""
+    price    = get_price(symbol)
+    raw_qty  = usdt_amount / price
+    quantity = float(exchange.amount_to_precision(symbol, raw_qty))
+    order    = exchange.create_market_buy_order(symbol, quantity)
     return order
 
 def sell_market(symbol: str, quantity: float) -> dict:
-    """Sell exact `quantity` of base asset at market price."""
-    order = exchange.create_market_sell_order(symbol, quantity)
+    qty   = float(exchange.amount_to_precision(symbol, quantity))
+    order = exchange.create_market_sell_order(symbol, qty)
     return order
+
+# =============================================================
+# FEE CALCULATOR
+# =============================================================
+
+def calc_fees(buy_price: float, sell_price: float, quantity: float) -> dict:
+    """
+    Returns detailed fee breakdown per trade.
+    Binance charges 0.1% on both buy and sell (taker fee).
+    """
+    buy_value   = buy_price  * quantity
+    sell_value  = sell_price * quantity
+    buy_fee     = round(buy_value  * BINANCE_FEE_RATE, 6)
+    sell_fee    = round(sell_value * BINANCE_FEE_RATE, 6)
+    total_fee   = round(buy_fee + sell_fee, 6)
+    return {
+        "buy_fee_usdt":   buy_fee,
+        "sell_fee_usdt":  sell_fee,
+        "total_fee_usdt": total_fee,
+    }
 
 # =============================================================
 # VOLUME CALCULATOR
@@ -156,238 +198,376 @@ def calculate_total_volume() -> float:
     return total
 
 # =============================================================
-# BALANCE CHECKER
-# =============================================================
-
-def get_usdt_balance() -> float:
-    balance = exchange.fetch_balance()
-    return float(balance["USDT"]["free"])
-
-# =============================================================
 # SINGLE TRADE CYCLE
 # =============================================================
 
-def run_trade_cycle(symbol: str, usdt_amount: float) -> dict:
-    """
-    1. Wait for dip
-    2. Buy
-    3. Monitor for +0.3% profit OR -0.5% stop-loss OR timeout
-    4. Sell
-    Returns result dict with all trade info.
-    """
+def run_trade_cycle(symbol: str, usdt_amount: float, pkr_rate: float) -> dict:
+
+    # Randomize hold time per trade — looks human (25–45 min)
+    hold_seconds = random.randint(MIN_HOLD_MINUTES * 60, MAX_HOLD_MINUTES * 60)
+
     result = {
-        "symbol":       symbol,
-        "usdt_amount":  usdt_amount,
-        "buy_price":    None,
-        "sell_price":   None,
-        "quantity":     None,
-        "pnl_usdt":     None,
-        "pnl_pct":      None,
-        "reason":       None,
-        "status":       "pending",
-        "buy_time":     None,
-        "sell_time":    None,
+        "symbol":          symbol,
+        "usdt_amount":     usdt_amount,
+        "buy_price":       None,
+        "sell_price":      None,
+        "quantity":        None,
+        "pnl_usdt":        None,
+        "pnl_pct":         None,
+        "fee_breakdown":   None,
+        "net_pnl_usdt":    None,
+        "reason":          None,
+        "status":          "pending",
+        "buy_time":        None,
+        "sell_time":       None,
+        "hold_minutes":    round(hold_seconds / 60, 1),
     }
 
-    # ── Step 1: Wait for dip (max 5 minutes) ──────────────────
-    dip_wait = 0
+    # ── Step 1: Wait for dip (max 5 min) ──────────────────────
+    # ── [CHANGE 2] Track dip detection with a flag ─────────────
+    # OLD: loop fell through silently → always bought even without dip
+    # NEW: dip_detected flag — if False after loop, skip trade entirely
+    dip_detected = False
+    dip_wait     = 0
     while dip_wait < 300:
         try:
             is_dip, dip_pct = detect_dip(symbol)
             if is_dip:
+                print(f"[{symbol}] Dip detected: {dip_pct}% — buying!")
+                dip_detected = True
                 break
+            else:
+                print(f"[{symbol}] No dip ({dip_pct}%), waiting 20s...")
         except Exception as e:
-            print(f"[{symbol}] Dip check error: {e}")
+            print(f"[{symbol}] Dip error: {e}")
         time.sleep(20)
         dip_wait += 20
 
+    # ── [CHANGE 2] Skip trade if no dip found ─────────────────
+    if not dip_detected:
+        result["status"] = "skipped"
+        result["reason"] = "no_dip_detected"
+        print(f"[{symbol}] ⏭️  No dip after 5 min — skipping trade. Capital preserved.")
+        send_slack(f"⏭️ *{symbol}* — No dip detected after 5 min. Trade skipped. Capital preserved.")
+        return result
+
     # ── Step 2: BUY ───────────────────────────────────────────
     try:
-        buy_order = buy_market(symbol, usdt_amount)
-        buy_price = float(buy_order.get("average") or buy_order.get("price") or get_price(symbol))
-        quantity  = float(buy_order.get("filled") or buy_order.get("amount"))
+        buy_order  = buy_market(symbol, usdt_amount)
 
+        # ── [CHANGE 3] Buy price — fetch_order() for real fill price
+        # OLD: fell back to get_price(symbol) which fetches a NEW live
+        #      price that may have moved — corrupting PnL calculation
+        # NEW: fetch_order() asks Binance for the EXACT fill price
+        buy_price = float(buy_order.get("average") or 0)
+        if not buy_price:
+            try:
+                order_id  = buy_order["id"]
+                order_info = exchange.fetch_order(order_id, symbol)
+                buy_price  = float(order_info["average"])
+                print(f"[{symbol}] Buy price from fetch_order: {buy_price}")
+            except Exception as fe:
+                # Last resort: use price field from original order only
+                buy_price = float(buy_order.get("price") or 0)
+                print(f"[{symbol}] fetch_order failed, using order price: {buy_price}. Error: {fe}")
+
+        quantity = float(
+            buy_order.get("filled") or
+            buy_order.get("amount")
+        )
         result["buy_price"] = buy_price
         result["quantity"]  = quantity
         result["buy_time"]  = datetime.utcnow().strftime("%H:%M:%S UTC")
         result["status"]    = "bought"
+        print(f"[{symbol}] ✅ Bought {quantity} @ {buy_price} | Hold: {result['hold_minutes']} min")
     except Exception as e:
         result["status"] = "buy_failed"
         result["reason"] = str(e)
+        print(f"[{symbol}] ❌ BUY FAILED: {e}")
         return result
 
-    # ── Step 3: MONITOR ───────────────────────────────────────
+    # ── Step 3: MONITOR — profit / stop-loss / timeout ────────
     start_time = time.time()
     while True:
         elapsed = time.time() - start_time
-
         try:
             current_price = get_price(symbol)
             change_pct    = (current_price - buy_price) / buy_price
+            print(f"[{symbol}] Price: {current_price} | Change: {round(change_pct*100,3)}% | Elapsed: {round(elapsed/60,1)}min")
 
-            # Take profit
+            # ── [CHANGE 4] Fee-aware take-profit ──────────────
+            # OLD: exited at +0.3% regardless of whether fees ate the profit
+            # NEW: only exits if NET profit after fees > MIN_NET_PROFIT_USDT
             if change_pct >= PROFIT_TARGET:
-                result["reason"] = "take_profit"
-                break
+                estimated_fees = calc_fees(buy_price, current_price, quantity)
+                gross_profit   = (current_price - buy_price) * quantity
+                net_profit     = gross_profit - estimated_fees["total_fee_usdt"]
+                if net_profit >= MIN_NET_PROFIT_USDT:
+                    result["reason"] = "take_profit"
+                    break
+                else:
+                    print(f"[{symbol}] ⚠️  +0.3% reached but net profit {round(net_profit,6)} USDT < min threshold. Holding...")
 
-            # Stop loss
             if change_pct <= -STOP_LOSS:
                 result["reason"] = "stop_loss"
                 break
-
-            # Timeout
-            if elapsed >= CYCLE_SECONDS:
+            if elapsed >= hold_seconds:
                 result["reason"] = "timeout"
                 break
-
         except Exception as e:
-            print(f"[{symbol}] Price poll error: {e}")
-
+            print(f"[{symbol}] Poll error: {e}")
         time.sleep(POLL_INTERVAL)
 
-    # ── Step 4: SELL ──────────────────────────────────────────
-    try:
-        sell_order = sell_market(symbol, quantity)
-        sell_price = float(sell_order.get("average") or sell_order.get("price") or get_price(symbol))
+    # ── Step 4: SELL — with retry circuit breaker ─────────────
+    # ── [CHANGE 5] Retry up to 3 times with 10s gaps ──────────
+    # OLD: single attempt — if it failed, open position stuck forever
+    # NEW: 3 attempts → on all failures, fire critical Slack alert
+    sell_order  = None
+    sell_success = False
+    for attempt in range(1, 4):
+        try:
+            sell_order   = sell_market(symbol, quantity)
+            sell_success = True
+            print(f"[{symbol}] ✅ Sell succeeded on attempt {attempt}")
+            break
+        except Exception as e:
+            print(f"[{symbol}] ❌ Sell attempt {attempt}/3 failed: {e}")
+            if attempt < 3:
+                time.sleep(10)
 
-        pnl_usdt = (sell_price - buy_price) * quantity
-        pnl_pct  = (sell_price - buy_price) / buy_price * 100
+    if not sell_success:
+        # All 3 attempts failed — critical alert, do NOT silently move on
+        critical_msg = (
+            f"🚨 *CRITICAL — SELL FAILED 3x* 🚨\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"  Pair     : {symbol}\n"
+            f"  Quantity : {quantity}\n"
+            f"  Buy Price: {buy_price}\n"
+            f"  Action   : ⚠️ MANUAL SELL REQUIRED on Binance NOW\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        send_slack(critical_msg)
+        result["status"] = "sell_failed_critical"
+        result["reason"] = "sell_failed_after_3_attempts"
+        print(f"[{symbol}] 🚨 SELL FAILED AFTER 3 ATTEMPTS — MANUAL INTERVENTION REQUIRED")
+        return result
 
-        result["sell_price"] = sell_price
-        result["sell_time"]  = datetime.utcnow().strftime("%H:%M:%S UTC")
-        result["pnl_usdt"]   = round(pnl_usdt, 4)
-        result["pnl_pct"]    = round(pnl_pct, 4)
-        result["status"]     = "sold"
-    except Exception as e:
-        result["status"] = "sell_failed"
-        result["reason"] = str(e)
+    # ── Sell succeeded — record results ───────────────────────
+    # ── [CHANGE 3] Sell price — fetch_order() for real fill price
+    sell_price = float(sell_order.get("average") or 0)
+    if not sell_price:
+        try:
+            sell_order_id   = sell_order["id"]
+            sell_order_info = exchange.fetch_order(sell_order_id, symbol)
+            sell_price      = float(sell_order_info["average"])
+            print(f"[{symbol}] Sell price from fetch_order: {sell_price}")
+        except Exception as fe:
+            sell_price = float(sell_order.get("price") or 0)
+            print(f"[{symbol}] fetch_order (sell) failed, using order price: {sell_price}. Error: {fe}")
+
+    fees      = calc_fees(buy_price, sell_price, quantity)
+    gross_pnl = (sell_price - buy_price) * quantity
+    net_pnl   = gross_pnl - fees["total_fee_usdt"]
+
+    result["sell_price"]     = sell_price
+    result["sell_time"]      = datetime.utcnow().strftime("%H:%M:%S UTC")
+    result["pnl_usdt"]       = round(gross_pnl, 4)
+    result["pnl_pct"]        = round((sell_price - buy_price) / buy_price * 100, 4)
+    result["fee_breakdown"]  = fees
+    result["net_pnl_usdt"]   = round(net_pnl, 4)
+    result["status"]         = "sold"
+    print(f"[{symbol}] ✅ Sold @ {sell_price} | Net PnL: {round(net_pnl,4)} USDT")
 
     return result
 
 # =============================================================
-# SLACK REPORT BUILDER
+# SLACK REPORT — full detail per your requirements
 # =============================================================
 
-def build_slack_report(allocations: dict, results: list, total_volume: float, usdt_balance: float) -> str:
+def build_slack_report(
+    cycle: int,
+    allocations: dict,
+    results: list,
+    total_volume: float,
+    usdt_balance: float,
+    pkr_rate: float
+) -> str:
 
-    pkr_balance = round(usdt_balance * PKR_RATE, 2)
-    total_pnl   = sum(r["pnl_usdt"] for r in results if r["pnl_usdt"] is not None)
-    total_pnl   = round(total_pnl, 4)
-    pnl_emoji   = "🟢" if total_pnl >= 0 else "🔴"
+    pkr_balance    = round(usdt_balance * pkr_rate, 2)
+    total_gross    = round(sum(r["pnl_usdt"]     or 0 for r in results), 4)
+    total_net      = round(sum(r["net_pnl_usdt"] or 0 for r in results), 4)
+    total_fees     = round(sum((r["fee_breakdown"]["total_fee_usdt"] if r.get("fee_breakdown") else 0) for r in results), 6)
+    total_fees_pkr = round(total_fees * pkr_rate, 2)
+    net_emoji      = "🟢" if total_net >= 0 else "🔴"
 
     lines = [
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        "🤖 *VOLUME BOT — CYCLE REPORT*",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🤖 *VOLUME BOT — CYCLE #{cycle} REPORT*",
         f"🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        "━━━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
         "",
         "💰 *ALLOCATION THIS CYCLE*",
     ]
-
     for pair, amt in allocations.items():
-        pct = round(amt / TOTAL_CAPITAL * 100, 1)
-        lines.append(f"  • {pair}: {amt} USDT ({pct}%)")
+        pct = round(amt / usdt_balance * 100, 1)
+        lines.append(f"  • {pair}: {amt} USDT  ({pct}% of balance)")
 
-    lines += ["", "📊 *TRADE RESULTS*"]
+    lines += ["", "📊 *TRADE RESULTS*", ""]
 
     for r in results:
         sym    = r["symbol"]
         status = r["status"]
 
         if status == "sold":
-            sign   = "+" if r["pnl_usdt"] >= 0 else ""
-            emoji  = "✅" if r["pnl_usdt"] >= 0 else "⚠️"
+            fees       = r["fee_breakdown"]
+            gross      = r["pnl_usdt"]
+            net        = r["net_pnl_usdt"]
+            g_sign     = "+" if gross >= 0 else ""
+            n_sign     = "+" if net   >= 0 else ""
+            trade_emoji = "✅" if net >= 0 else "⚠️"
+
+            buy_fee_pkr  = round(fees["buy_fee_usdt"]  * pkr_rate, 1)
+            sell_fee_pkr = round(fees["sell_fee_usdt"] * pkr_rate, 1)
+            total_f_pkr  = round(fees["total_fee_usdt"] * pkr_rate, 1)
+
             reason_map = {
-                "take_profit": "🎯 Take Profit",
-                "stop_loss":   "🛡 Stop Loss",
-                "timeout":     "⏱ Timeout",
+                "take_profit": "🎯 Take Profit (+0.3%)",
+                "stop_loss":   "🛡️ Stop Loss (-0.5%)",
+                "timeout":     f"⏱️ Timeout ({r['hold_minutes']} min)",
             }
-            reason_label = reason_map.get(r["reason"], r["reason"])
+
             lines += [
-                f"  {emoji} *{sym}*",
-                f"     Allocated : {r['usdt_amount']} USDT",
-                f"     Buy Price : {r['buy_price']}",
-                f"     Sell Price: {r['sell_price']}",
-                f"     Qty       : {r['quantity']}",
-                f"     P&L       : {sign}{r['pnl_usdt']} USDT ({sign}{r['pnl_pct']}%)",
-                f"     Exit Reason: {reason_label}",
-                f"     Time      : {r['buy_time']} → {r['sell_time']}",
+                f"  {trade_emoji} *{sym}*",
+                f"     Allocated   : {r['usdt_amount']} USDT",
+                f"     Buy Price   : {r['buy_price']} USDT",
+                f"     Sell Price  : {r['sell_price']} USDT",
+                f"     Quantity    : {r['quantity']}",
+                f"     Gross P&L   : {g_sign}{gross} USDT  ({g_sign}{r['pnl_pct']}%)",
+                f"     🏦 Buy Fee  : {fees['buy_fee_usdt']} USDT  (≈ Rs{buy_fee_pkr})",
+                f"     🏦 Sell Fee : {fees['sell_fee_usdt']} USDT  (≈ Rs{sell_fee_pkr})",
+                f"     🏦 Total Fee: {fees['total_fee_usdt']} USDT  (≈ Rs{total_f_pkr})",
+                f"     Net P&L     : {n_sign}{net} USDT",
+                f"     Exit Reason : {reason_map.get(r['reason'], r['reason'])}",
+                f"     Hold Time   : {r['hold_minutes']} min",
+                f"     Time        : {r['buy_time']} → {r['sell_time']}",
+                "",
             ]
         elif status == "buy_failed":
-            lines += [f"  ❌ *{sym}* — BUY FAILED: {r['reason']}"]
-        elif status == "sell_failed":
-            lines += [f"  ❌ *{sym}* — SELL FAILED: {r['reason']}"]
+            lines += [f"  ❌ *{sym}* — BUY FAILED", f"     Reason: {r['reason']}", ""]
+        elif status == "sell_failed_critical":
+            lines += [
+                f"  🚨 *{sym}* — SELL FAILED (3 ATTEMPTS) — MANUAL ACTION REQUIRED",
+                f"     Quantity: {r.get('quantity', 'N/A')} | Buy Price: {r.get('buy_price', 'N/A')}",
+                "",
+            ]
+        elif status == "skipped":
+            lines += [f"  ⏭️ *{sym}* — SKIPPED (no dip detected in 5 min)", ""]
         else:
-            lines += [f"  ⚪ *{sym}* — {status}"]
+            lines += [f"  ⚪ *{sym}* — {status}", ""]
 
     lines += [
-        "",
-        "━━━━━━━━━━━━━━━━━━━━━━",
-        f"{pnl_emoji} *CYCLE P&L     :* {'+' if total_pnl >= 0 else ''}{total_pnl} USDT",
-        f"📈 *TOTAL VOLUME :* {round(total_volume, 2)} USDT",
-        f"💵 *USDT BALANCE :* {round(usdt_balance, 2)} USDT",
-        f"🇵🇰 *PKR BALANCE  :* {pkr_balance:,} PKR",
-        "━━━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"💸 *TOTAL FEES PAID  :* {total_fees} USDT  (≈ Rs{total_fees_pkr})",
+        f"📈 *GROSS CYCLE P&L  :* {'+' if total_gross >= 0 else ''}{total_gross} USDT",
+        f"{net_emoji} *NET CYCLE P&L    :* {'+' if total_net >= 0 else ''}{total_net} USDT",
+        f"📊 *TOTAL VOLUME     :* {round(total_volume, 2)} USDT",
+        f"💵 *USDT BALANCE     :* {round(usdt_balance, 2)} USDT",
+        f"🇵🇰 *PKR BALANCE      :* Rs{pkr_balance:,.2f}",
+        f"💱 *LIVE PKR RATE    :* 1 USDT = Rs{pkr_rate}",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
 
     return "\n".join(lines)
 
 # =============================================================
-# MAIN BOT LOOP
+# MAIN LOOP
 # =============================================================
 
 def run_bot():
-    send_slack("🚀 *Volume Bot Started!*\nPairs: BNB/USDT | USDC/USDT | BTC/USDT\nCapital: 57 USDT\nStrategy: Buy Dip → +0.3% Profit | -0.5% Stop Loss")
+
+    # Startup message
+    send_slack(
+        "🚀 *Volume Bot v4 — LIVE*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Pairs    : BNB/USDT | USDC/USDT | BTC/USDT\n"
+        "Strategy : Buy Dip (-0.2%) → Sell +0.3% profit\n"
+        "Stop Loss: -0.5% per trade\n"
+        "Hold Time: Random 25–45 min per trade\n"
+        "Capital  : Live balance (auto-adjusts for fees)\n"
+        "PKR Rate : Live from CoinGecko\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
 
     cycle_count = 0
 
     while True:
         cycle_count += 1
-        send_slack(f"🔄 *Cycle #{cycle_count} starting...*")
 
-        # ── Randomize allocations ────────────────────────────
-        allocations = randomize_allocations(TOTAL_CAPITAL)
+        # ── Fetch live data at start of each cycle ─────────────
+        try:
+            pkr_rate     = get_pkr_rate()
+            live_capital = get_live_capital()
+        except Exception as e:
+            send_slack(f"❌ Could not fetch balance/PKR rate: {e}")
+            time.sleep(60)
+            continue
 
-        alloc_msg = "💰 *Allocations this cycle:*\n" + "\n".join(
-            f"  • {p}: {a} USDT" for p, a in allocations.items()
+        pkr_total = round(live_capital * pkr_rate, 2)
+
+        send_slack(
+            f"🔄 *Cycle #{cycle_count} Starting*\n"
+            f"💵 Live Capital : {live_capital} USDT\n"
+            f"🇵🇰 In PKR       : Rs{pkr_total:,.2f}\n"
+            f"💱 PKR Rate     : 1 USDT = Rs{pkr_rate}"
         )
-        send_slack(alloc_msg)
 
-        # ── Run all 3 trades (sequentially) ─────────────────
-        # Sequential is safer for 57 USDT — avoids splitting thin balance
+        # ── Randomize allocations from live balance ─────────────
+        allocations = randomize_allocations(live_capital)
+        alloc_lines = "\n".join(
+            f"  • {p}: {a} USDT  ({round(a/live_capital*100,1)}%)"
+            for p, a in allocations.items()
+        )
+        send_slack(f"💰 *Allocations — Cycle #{cycle_count}*\n{alloc_lines}")
+
+        # ── Run trades sequentially ─────────────────────────────
         results = []
         for pair in PAIRS:
             amt = allocations[pair]
-            send_slack(f"⏳ *Trading {pair}* with {amt} USDT...")
-            result = run_trade_cycle(pair, amt)
+            send_slack(f"⏳ *{pair}* — Entering with {amt} USDT...")
+            result = run_trade_cycle(pair, amt, pkr_rate)
             results.append(result)
 
-            # Brief random pause between trades (looks human)
-            pause = random.randint(45, 120)
+            # Human-like random pause between trades
+            pause = random.randint(60, 180)
+            print(f"[Bot] Pausing {pause}s before next pair...")
             time.sleep(pause)
 
-        # ── Fetch final stats ────────────────────────────────
+        # ── Final stats ─────────────────────────────────────────
         try:
             total_volume  = calculate_total_volume()
-            usdt_balance  = get_usdt_balance()
+            usdt_balance  = get_live_capital()   # re-fetch after trades
         except Exception as e:
             total_volume  = 0.0
-            usdt_balance  = 0.0
+            usdt_balance  = live_capital
             print(f"[Stats error] {e}")
 
-        # ── Send full Slack report ───────────────────────────
-        report = build_slack_report(allocations, results, total_volume, usdt_balance)
+        # ── Send full Slack report ──────────────────────────────
+        report = build_slack_report(
+            cycle        = cycle_count,
+            allocations  = allocations,
+            results      = results,
+            total_volume = total_volume,
+            usdt_balance = usdt_balance,
+            pkr_rate     = pkr_rate
+        )
         send_slack(report)
 
-        # ── Random cooldown between cycles (8–15 min) ────────
+        # ── Random cooldown 8–15 min ────────────────────────────
         cooldown = random.randint(480, 900)
-        send_slack(f"😴 *Cooldown:* {cooldown // 60} min before next cycle...")
+        cd_min   = round(cooldown / 60, 1)
+        send_slack(f"😴 *Cycle #{cycle_count} complete. Cooldown: {cd_min} min...*")
         time.sleep(cooldown)
 
-
-# =============================================================
-# ENTRY POINT
-# =============================================================
 
 if __name__ == "__main__":
     run_bot()
