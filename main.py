@@ -9,10 +9,10 @@ import os
 # CONFIG
 # =============================================================
 
-
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "rcCZpy9TD4f2KJ9wzvBnrtUdCaX4ny205uPTbKQmMTaiebUet5KVmHMrY9Z2wvyr")
 BINANCE_SECRET     = os.getenv("BINANCE_SECRET", "I573pDLsdjhVNWsRrjfHVpRvand6yM82fhC2VnXMEJJxxTS3dX1fRuNWrt8CW65h")
 SLACK_WEBHOOK_URL  = os.getenv("SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/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")
+
 
 PKR_RATE       = 281.0          # Updated live each cycle from CoinGecko
 PAIRS          = ["BNB/USDT", "USDC/USDT", "BTC/USDT"]
@@ -54,7 +54,11 @@ exchange = ccxt.binance({
     "secret":          BINANCE_SECRET,
     "enableRateLimit": True,
     "options": {
-        "defaultType": "spot"
+        "defaultType":      "spot",
+        # Disable fetch_currencies — this stops CCXT from calling
+        # /sapi/v1/capital/config/getall which is geo-restricted
+        # on cloud servers. We don't need currency info for spot trading.
+        "fetchCurrencies":  False,
     }
 })
 
