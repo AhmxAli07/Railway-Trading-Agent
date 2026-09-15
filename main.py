@@ -9,9 +9,9 @@ import os
 # CONFIG
 # =============================================================
 
-BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "rcCZpy9TD4f2KJ9wzvBnrtUdCaX4ny205uPTbKQmMTaiebUet5KVmHMrY9Z2wvyr")
-BINANCE_SECRET     = os.getenv("BINANCE_SECRET", "I573pDLsdjhVNWsRrjfHVpRvand6yM82fhC2VnXMEJJxxTS3dX1fRuNWrt8CW65h")
-# SLACK_WEBHOOK_URL  = os.getenv("SLACK_WEBHOOK_URL", "https://hooks.slack.com/services/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")
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_SECRET = os.getenv("BINANCE_SECRET")
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
 
 PKR_RATE       = 281.0          # Updated live each cycle from CoinGecko
